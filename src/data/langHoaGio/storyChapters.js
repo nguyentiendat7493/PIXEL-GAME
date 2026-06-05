@@ -1,0 +1,42 @@
+export const storyChapters = [
+  {
+    id: 'spring-awakening',
+    chapter: 1,
+    title: 'Mua Xuan Thuc Giac',
+    guideNpc: 'Ba Linh',
+    objective: 'Restore 10 crop beds and harvest 50 carrots plus 30 turnips for the Spring Feast.',
+    rewards: ['Spring Essence', 'Cooking Recipe Lv1', 'Unlock Village Market'],
+  },
+  {
+    id: 'summer-trial',
+    chapter: 2,
+    title: 'He Lua Thu Thach',
+    guideNpc: 'Anh Minh',
+    objective: 'Recover Ice Ore in the mountain cave and forge the Divine Watering Can.',
+    rewards: ['Summer Essence', 'Divine Watering Can 3x3', 'Unlock Mountain Cave'],
+  },
+  {
+    id: 'autumn-memory',
+    chapter: 3,
+    title: 'Thu Vang Ky Uc',
+    guideNpc: 'Co Mai',
+    objective: 'Collect 5 precious flowers in diary order and gift them to the right villagers.',
+    rewards: ['Autumn Essence', 'Unlock Ancient Forest', 'Advanced Recipe Book'],
+  },
+  {
+    id: 'winter-secret',
+    chapter: 4,
+    title: 'Dong Bang Bi An',
+    guideNpc: 'Be Khanh',
+    objective: 'Explore the farm basement, test 3 mysterious crops, and decode the past message.',
+    rewards: ['Winter Essence', 'Legendary Seeds', 'Unlock Secret Basement'],
+  },
+  {
+    id: 'five-year-festival',
+    chapter: 5,
+    title: 'Le Hoi Nam Nam',
+    guideNpc: 'All NPCs',
+    objective: 'Open the Ancient Music Box, cook 20 dishes, invite 10 NPCs, and reach 100 decoration points.',
+    rewards: ['True Ending', 'Special Farm Skin', 'New Game Plus'],
+  },
+];
