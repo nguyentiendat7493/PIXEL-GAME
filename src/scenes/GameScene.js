@@ -1,4 +1,43 @@
 import Phaser from 'phaser';
+import {
+  advanceRumor,
+  findJournalPage,
+  getStoryHudLines,
+  getStoryPanelLines,
+  increaseReputation,
+} from '../systems/storyProgress.js';
+import { createStoryPanel } from '../ui/storyPanel.js';
+import { createSystemCatalogPanel } from '../ui/systemCatalogPanel.js';
+import { createQuestJournalPanel } from '../ui/questJournalPanel.js';
+import { createMapPanel } from '../ui/mapPanel.js';
+import { createWeatherPanel } from '../ui/weatherPanel.js';
+import { createToolUpgradePanel } from '../ui/toolUpgradePanel.js';
+import { createPlayerProfilePanel } from '../ui/playerProfilePanel.js';
+import { createDecorationPanel } from '../ui/decorationPanel.js';
+import { greenHollowNpcs } from '../data/npcs/index.js';
+import { talkToNpc, getNpcById } from '../systems/npcSystem.js';
+import { createInitialGameState } from '../systems/gameState.js';
+import { loadGame, saveGame } from '../systems/saveSystem.js';
+import { advanceDay, getWeatherInfo } from '../systems/worldSystem.js';
+import { getQuestJournalView, getQuestSummary, recordQuestProgress } from '../systems/questSystem.js';
+import { giveGiftToNpc } from '../systems/giftSystem.js';
+import { getCurrentMap, getUnlockedMaps, travelToMap, unlockMap } from '../systems/mapSystem.js';
+import { getToolUpgradeRows, upgradeTool } from '../systems/toolUpgradeSystem.js';
+import { addSkillExp, getSkillRows } from '../systems/skillSystem.js';
+import {
+  getAestheticScore,
+  getDecorationById,
+  getSelectedDecoration,
+  placeDecoration,
+  selectDecoration,
+} from '../systems/decorationSystem.js';
+import {
+  createSystemCatalogState,
+  getSystemCatalogView,
+  nextSystem,
+  previousSystem,
+  scrollSystemCatalog,
+} from '../systems/systemCatalog.js';
 
 const TILE_SIZE = 32;
 const VIEW_WIDTH = 900;
@@ -6,6 +45,7 @@ const VIEW_HEIGHT = 560;
 const MAP_COLS = 36;
 const MAP_ROWS = 24;
 const TOOLBAR_Y = 496;
+const PLAYER_WALK_SEQUENCE = [0, 1, 2, 1];
 
 const PlotState = {
   EMPTY: 'empty',
@@ -45,22 +85,33 @@ const CropTypes = {
 export default class GameScene extends Phaser.Scene {
   constructor() {
     super('GameScene');
-    this.money = 40;
-    this.inventory = {
+    this.gameState = loadGame() ?? createInitialGameState();
+    this.money = this.gameState.player.money;
+    this.inventory = this.gameState.inventory ?? {
       seed_white: 4,
       seed_green: 2,
       seed_blue: 1,
       crop_white: 0,
       crop_green: 0,
       crop_blue: 0,
+      gift_rose: 2,
+      gift_iron_ore: 2,
+      gift_book: 1,
+      gift_candy: 2,
+      gift_mushroom: 1,
     };
-    this.chest = {
+    this.chest = this.gameState.chest ?? {
       seed_white: 0,
       seed_green: 0,
       seed_blue: 0,
       crop_white: 0,
       crop_green: 0,
       crop_blue: 0,
+      gift_rose: 0,
+      gift_iron_ore: 0,
+      gift_book: 0,
+      gift_candy: 0,
+      gift_mushroom: 0,
     };
     this.plots = new Map();
     this.selectedTool = 'hoe';
@@ -76,6 +127,16 @@ export default class GameScene extends Phaser.Scene {
     this.lastDirection = 'down';
     this.walkFrame = 0;
     this.walkFrameTime = 0;
+    this.toolPoseUntil = 0;
+    this.storyState = this.gameState.story;
+    this.systemCatalogState = createSystemCatalogState();
+    this.npcState = this.gameState.npcs;
+    this.worldState = this.gameState.world;
+    this.questState = this.gameState.quests;
+    this.mapState = this.gameState.maps ?? { currentMapId: 'MAP_01', unlockedMapIds: ['MAP_01'] };
+    this.decorationState = this.gameState.decorations ?? { selectedDecorationId: 'flowerPot', placed: [] };
+    this.npcSprites = {};
+    this.decorationSprites = [];
   }
 
   create() {
@@ -85,8 +146,14 @@ export default class GameScene extends Phaser.Scene {
     this.createCamera();
     this.createHud();
     this.createControls();
+    this.createWeatherEffects();
+    this.renderPlacedDecorations();
 
     this.input.on('pointerdown', (pointer) => this.handleWorldClick(pointer));
+    this.input.on('wheel', (_pointer, _gameObjects, _deltaX, deltaY) => {
+      if (this.activePanel !== 'systems') return;
+      this.scrollGameSystems(deltaY > 0 ? 3 : -3);
+    });
     this.time.addEvent({
       delay: 1000,
       loop: true,
@@ -98,29 +165,31 @@ export default class GameScene extends Phaser.Scene {
 
   update() {
     this.movePlayer();
+    this.updateWeatherEffects();
   }
 
   createTextures() {
-    this.makeTileTexture('grass', '#78aa55', '#5f914a', 'grass');
-    this.makeTileTexture('soil', '#8b5a34', '#6f4026', 'soil');
-    this.makeTileTexture('tilled', '#6f4628', '#4c2e1d', 'tilled');
-    this.makeTileTexture('wateredSoil', '#594032', '#3e5368', 'watered');
-    this.makeTileTexture('path', '#b99461', '#8d6b42', 'path');
-    this.makeTileTexture('water', '#4f93bb', '#86d5ef', 'water');
+    if (!this.textures.exists('grass')) this.makeTileTexture('grass', '#78aa55', '#5f914a', 'grass');
+    if (!this.textures.exists('soil')) this.makeTileTexture('soil', '#8b5a34', '#6f4026', 'soil');
+    if (!this.textures.exists('tilled')) this.makeTileTexture('tilled', '#6f4628', '#4c2e1d', 'tilled');
+    if (!this.textures.exists('wateredSoil')) this.makeTileTexture('wateredSoil', '#594032', '#3e5368', 'watered');
+    if (!this.textures.exists('path')) this.makeTileTexture('path', '#b99461', '#8d6b42', 'path');
+    if (!this.textures.exists('water')) this.makeTileTexture('water', '#4f93bb', '#86d5ef', 'water');
     Object.entries(CropTypes).forEach(([key, crop]) => this.makeCropTextures(key, crop));
     this.makeSeedTexture();
     this.makeVegetableTexture();
     this.makeBackpackTexture();
     this.makeUiIconTextures();
     this.makePlayerTextures();
-    this.makeHouseTexture();
-    this.makeFenceTexture();
-    this.makeTreeTexture();
-    this.makeRockTexture();
-    this.makeBarrelTexture();
-    this.makeFlowerTexture();
-    this.makeBushTexture();
+    if (!this.textures.exists('house')) this.makeHouseTexture();
+    if (!this.textures.exists('fence')) this.makeFenceTexture();
+    if (!this.textures.exists('tree')) this.makeTreeTexture();
+    if (!this.textures.exists('rock')) this.makeRockTexture();
+    if (!this.textures.exists('barrel')) this.makeBarrelTexture();
+    if (!this.textures.exists('flower')) this.makeFlowerTexture();
+    if (!this.textures.exists('bush')) this.makeBushTexture();
     this.makeBlockerTexture();
+    this.makeNpcTextures();
     this.createExtractedSpriteTextures();
   }
 
@@ -170,6 +239,8 @@ export default class GameScene extends Phaser.Scene {
   }
 
   extractSpriteTexture(key, sx, sy, sw, sh, dw = sw, dh = sh) {
+    if (this.textures.exists(key)) return;
+
     const source = this.textures.get('farmSpritesReference').getSourceImage();
     const canvas = document.createElement('canvas');
     canvas.width = dw;
@@ -399,6 +470,69 @@ export default class GameScene extends Phaser.Scene {
       ctx.fillStyle = '#9b6225';
       ctx.fillRect(16, 11, 4, 10);
     });
+    this.makeIconTexture('bookIcon', (ctx) => {
+      ctx.fillStyle = '#5b3828';
+      ctx.fillRect(7, 7, 8, 20);
+      ctx.fillRect(17, 7, 8, 20);
+      ctx.fillStyle = '#f0d3a0';
+      ctx.fillRect(9, 9, 6, 16);
+      ctx.fillRect(17, 9, 6, 16);
+      ctx.fillStyle = '#8b5a34';
+      ctx.fillRect(15, 8, 2, 18);
+      ctx.fillStyle = '#7a3f25';
+      ctx.fillRect(10, 13, 4, 2);
+      ctx.fillRect(18, 13, 4, 2);
+      ctx.fillRect(10, 18, 4, 2);
+      ctx.fillRect(18, 18, 4, 2);
+    });
+    this.makeIconTexture('questIcon', (ctx) => {
+      ctx.fillStyle = '#5b3828';
+      ctx.fillRect(8, 5, 16, 22);
+      ctx.fillStyle = '#f4f1df';
+      ctx.fillRect(10, 7, 12, 18);
+      ctx.fillStyle = '#7a3f25';
+      ctx.fillRect(12, 11, 8, 2);
+      ctx.fillRect(12, 15, 8, 2);
+      ctx.fillRect(12, 19, 6, 2);
+      ctx.fillStyle = '#4b6f3b';
+      ctx.fillRect(19, 22, 5, 5);
+    });
+    this.makeIconTexture('mapIcon', (ctx) => {
+      ctx.fillStyle = '#f4f1df';
+      ctx.fillRect(6, 7, 20, 18);
+      ctx.fillStyle = '#d9aa67';
+      ctx.fillRect(12, 7, 2, 18);
+      ctx.fillRect(20, 7, 2, 18);
+      ctx.fillStyle = '#4b6f3b';
+      ctx.fillRect(8, 10, 5, 5);
+      ctx.fillStyle = '#4f93bb';
+      ctx.fillRect(15, 15, 5, 5);
+      ctx.fillStyle = '#7a3f25';
+      ctx.fillRect(22, 11, 3, 3);
+      ctx.fillRect(9, 21, 3, 3);
+    });
+    this.makeIconTexture('weatherIcon', (ctx) => {
+      ctx.fillStyle = '#f4f1df';
+      ctx.fillRect(8, 12, 16, 8);
+      ctx.fillRect(11, 8, 10, 8);
+      ctx.fillStyle = '#75c9ed';
+      ctx.fillRect(9, 23, 2, 5);
+      ctx.fillRect(15, 23, 2, 5);
+      ctx.fillRect(21, 23, 2, 5);
+      ctx.fillStyle = '#ffd46b';
+      ctx.fillRect(22, 6, 5, 5);
+    });
+    this.makeIconTexture('moonIcon', (ctx) => {
+      ctx.fillStyle = '#263a59';
+      ctx.fillRect(7, 7, 18, 18);
+      ctx.fillStyle = '#f4f1df';
+      ctx.fillRect(11, 7, 12, 18);
+      ctx.fillStyle = '#263a59';
+      ctx.fillRect(17, 6, 10, 16);
+      ctx.fillStyle = '#f4f1df';
+      ctx.fillRect(9, 25, 3, 3);
+      ctx.fillRect(24, 10, 2, 2);
+    });
   }
 
   makeIconTexture(key, draw) {
@@ -408,6 +542,37 @@ export default class GameScene extends Phaser.Scene {
     const ctx = canvas.getContext('2d');
     draw(ctx);
     this.textures.addCanvas(key, canvas);
+  }
+
+  makeNpcTextures() {
+    greenHollowNpcs.forEach((npc) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = TILE_SIZE;
+      canvas.height = TILE_SIZE;
+      const ctx = canvas.getContext('2d');
+      const shirt = Phaser.Display.Color.IntegerToColor(npc.color).rgba;
+
+      ctx.fillStyle = 'rgba(30, 24, 18, 0.25)';
+      ctx.fillRect(7, 29, 18, 3);
+      ctx.fillStyle = '#4b3124';
+      ctx.fillRect(8, 4, 16, 6);
+      ctx.fillRect(6, 8, 20, 5);
+      ctx.fillStyle = '#f0c08a';
+      ctx.fillRect(10, 8, 12, 10);
+      ctx.fillStyle = '#1f1b18';
+      ctx.fillRect(12, 12, 2, 2);
+      ctx.fillRect(19, 12, 2, 2);
+      ctx.fillStyle = shirt;
+      ctx.fillRect(9, 18, 14, 10);
+      ctx.fillStyle = '#f0c08a';
+      ctx.fillRect(6, 19, 4, 7);
+      ctx.fillRect(23, 19, 4, 7);
+      ctx.fillStyle = '#263a59';
+      ctx.fillRect(9, 27, 5, 4);
+      ctx.fillRect(18, 27, 5, 4);
+
+      this.textures.addCanvas(`npc_${npc.id}`, canvas);
+    });
   }
 
   makePlayerTextures() {
@@ -596,7 +761,10 @@ export default class GameScene extends Phaser.Scene {
       for (let col = 0; col < MAP_COLS; col += 1) {
         const isWater = col >= 31 || (col >= 28 && row < 5);
         const isPath = row === 12 || row === 18 || col === 3 || (row >= 2 && row <= 18 && col === 15);
-        const texture = isWater ? 'water' : isPath ? 'path' : 'grass';
+        const isWaterEdge = isWater && (col === 31 || col === 28 || row === 5);
+        const isSand = !isWater && ((col >= 27 && col <= 30 && row < 7) || (col >= 29 && row >= 5));
+        const isStone = !isWater && row < 3 && col < 6;
+        const texture = this.getMapBaseTexture(col, row, { isWater, isPath, isWaterEdge, isSand, isStone });
         this.add.image(col * TILE_SIZE, row * TILE_SIZE, texture).setOrigin(0);
         if (isWater) this.createBlocker(col * TILE_SIZE, row * TILE_SIZE, TILE_SIZE, TILE_SIZE);
       }
@@ -620,6 +788,32 @@ export default class GameScene extends Phaser.Scene {
     }
 
     this.createProps();
+  }
+
+  getMapBaseTexture(col, row, terrain) {
+    const mapId = this.mapState.currentMapId;
+    if (mapId === 'MAP_02') return terrain.isPath || (col + row) % 3 === 0 ? 'path' : 'stoneGround';
+    if (mapId === 'MAP_03') return (col + row) % 5 === 0 ? 'path' : 'stoneGround';
+    if (mapId === 'MAP_04') return this.pickGrassTexture(col, row);
+    if (mapId === 'MAP_05') return terrain.isWater || col > 25 ? 'water' : 'sand';
+    if (mapId === 'MAP_06') return terrain.isStone ? 'stoneGround' : 'tilled';
+    if (mapId === 'MAP_07') return terrain.isPath ? 'path' : 'stoneGround';
+
+    return terrain.isWater
+          ? (terrain.isWaterEdge && this.textures.exists('waterEdge') ? 'waterEdge' : 'water')
+          : terrain.isPath
+            ? 'path'
+            : terrain.isSand && this.textures.exists('sand')
+              ? 'sand'
+              : terrain.isStone && this.textures.exists('stoneGround')
+                ? 'stoneGround'
+                : this.pickGrassTexture(col, row);
+  }
+
+  pickGrassTexture(col, row) {
+    if (this.textures.exists('grassFlowers') && (col * 17 + row * 23) % 29 === 0) return 'grassFlowers';
+    if (this.textures.exists('grassAlt') && (col * 7 + row * 11) % 5 === 0) return 'grassAlt';
+    return 'grass';
   }
 
   createProps() {
@@ -663,6 +857,26 @@ export default class GameScene extends Phaser.Scene {
     [[7, 2], [12, 2], [20, 6], [24, 10], [26, 14]].forEach(([col, row]) => {
       this.add.image(col * TILE_SIZE, row * TILE_SIZE, 'bush').setOrigin(0);
     });
+
+    this.createNpcs();
+  }
+
+  createNpcs() {
+    greenHollowNpcs.forEach((npc) => {
+      const x = npc.position.col * TILE_SIZE + TILE_SIZE / 2;
+      const y = npc.position.row * TILE_SIZE + TILE_SIZE / 2;
+      const sprite = this.physics.add.sprite(x, y, `npc_${npc.id}`);
+      sprite.npcId = npc.id;
+      sprite.setImmovable(true);
+      sprite.setSize(18, 14);
+      sprite.setOffset(7, 18);
+      sprite.setInteractive({ useHandCursor: true });
+      sprite.on('pointerdown', () => this.handleNpcClick(npc.id));
+
+      const label = this.add.text(x, y - 28, npc.name, this.textStyle(10, '#fff2cf')).setOrigin(0.5);
+      label.setDepth(10);
+      this.npcSprites[npc.id] = { sprite, label };
+    });
   }
 
   createBlocker(x, y, width, height) {
@@ -672,11 +886,14 @@ export default class GameScene extends Phaser.Scene {
   }
 
   createPlayer() {
-    this.player = this.physics.add.sprite(96, 128, 'player_down_0');
+    this.player = this.physics.add.sprite(96, 128, 'player_front_0');
     this.player.setCollideWorldBounds(true);
-    this.player.setSize(20, 18);
-    this.player.setOffset(14, 30);
+    this.player.setSize(18, 14);
+    this.player.setOffset(7, 18);
     this.physics.add.collider(this.player, this.blockers);
+    Object.values(this.npcSprites).forEach(({ sprite }) => {
+      this.physics.add.collider(this.player, sprite);
+    });
     this.physics.world.setBounds(0, 0, MAP_COLS * TILE_SIZE, MAP_ROWS * TILE_SIZE);
   }
 
@@ -689,17 +906,17 @@ export default class GameScene extends Phaser.Scene {
 
   createControls() {
     this.cursors = this.input.keyboard.createCursorKeys();
-    this.keys = this.input.keyboard.addKeys('W,A,S,D');
+    this.keys = this.input.keyboard.addKeys('W,A,S,D,U,P,R,ONE,TWO,THREE,FOUR,FIVE,SIX,SEVEN');
   }
 
   createHud() {
     this.fixed(this.add.rectangle(680, 10, 208, 76, 0x6f4428).setOrigin(0));
     this.fixed(this.add.rectangle(686, 16, 196, 64, 0xf0d3a0).setOrigin(0));
-    this.fixed(this.add.text(700, 24, 'Ngày 1  06:00', this.textStyle(15, '#4c2f1d')));
+    this.dateText = this.fixed(this.add.text(700, 24, '', this.textStyle(15, '#4c2f1d')));
     this.statsText = this.fixed(this.add.text(700, 50, '', this.textStyle(14, '#4c2f1d', 174)));
 
-    this.fixed(this.add.rectangle(176, TOOLBAR_Y - 8, 552, 58, 0x6f4428).setOrigin(0));
-    this.fixed(this.add.rectangle(184, TOOLBAR_Y, 536, 42, 0xd9aa67).setOrigin(0));
+    this.fixed(this.add.rectangle(16, TOOLBAR_Y - 8, 872, 58, 0x6f4428).setOrigin(0));
+    this.fixed(this.add.rectangle(24, TOOLBAR_Y, 856, 42, 0xd9aa67).setOrigin(0));
     [
       ['hoe', 'hoeIcon', () => this.selectTool('hoe')],
       ['seed', 'seedBag', () => this.selectTool('seed')],
@@ -708,15 +925,30 @@ export default class GameScene extends Phaser.Scene {
       ['inventory', 'backpackIcon', () => this.togglePanel('inventory')],
       ['shop', 'shopIcon', () => this.togglePanel('shop')],
       ['chest', 'chestIcon', () => this.togglePanel('chest')],
+      ['quests', 'questIcon', () => this.togglePanel('quests')],
+      ['maps', 'mapIcon', () => this.togglePanel('maps')],
+      ['weather', 'weatherIcon', () => this.togglePanel('weather')],
+      ['story', 'tree', () => this.togglePanel('story')],
+      ['systems', 'bookIcon', () => this.togglePanel('systems')],
+      ['sleep', 'moonIcon', () => this.sleepToNextDay()],
       ['sell', 'coinIcon', () => this.sellSelectedItem()],
     ].forEach(([key, icon, onClick], index) => {
-      this.toolbarSlots[key] = this.createToolbarSlot(194 + index * 64, TOOLBAR_Y + 4, key, icon, onClick);
+      this.toolbarSlots[key] = this.createToolbarSlot(20 + index * 61, TOOLBAR_Y + 4, key, icon, onClick);
     });
 
-    this.hintText = this.fixed(this.add.text(16, 16, '', this.textStyle(14, '#fff2cf', 360)));
+    this.hintBox = this.fixed(this.add.rectangle(16, 16, 392, 58, 0x263821, 0.86).setOrigin(0));
+    this.hintText = this.fixed(this.add.text(28, 26, '', this.textStyle(13, '#fff2cf', 350)));
     this.createShopPanel();
     this.createInventoryPanel();
     this.createChestPanel();
+    createQuestJournalPanel(this);
+    createMapPanel(this);
+    createWeatherPanel(this);
+    createStoryPanel(this);
+    createSystemCatalogPanel(this);
+    createToolUpgradePanel(this);
+    createPlayerProfilePanel(this);
+    createDecorationPanel(this);
     this.refreshHud();
   }
 
@@ -749,6 +981,7 @@ export default class GameScene extends Phaser.Scene {
       this.shopRows[key] = row;
       group.addMultiple([row, swatch, label]);
     });
+    group.setVisible(false);
   }
 
   createInventoryPanel() {
@@ -768,6 +1001,7 @@ export default class GameScene extends Phaser.Scene {
       this.itemRows[itemKey] = { row, label };
       group.addMultiple([row, icon, label]);
     });
+    group.setVisible(false);
   }
 
   createChestPanel() {
@@ -788,6 +1022,7 @@ export default class GameScene extends Phaser.Scene {
     const deposit = this.createPanelButton(group, x + 116, y + 294, 92, 32, 'Cất', () => this.depositSelectedItem());
     const withdraw = this.createPanelButton(group, x + 260, y + 294, 92, 32, 'Lấy', () => this.withdrawSelectedItem());
     group.addMultiple([deposit.bg, deposit.text, withdraw.bg, withdraw.text]);
+    group.setVisible(false);
   }
 
   createPanelButton(group, x, y, width, height, label, onClick) {
@@ -842,6 +1077,7 @@ export default class GameScene extends Phaser.Scene {
 
   fixed(gameObject) {
     gameObject.setScrollFactor(0);
+    gameObject.setDepth(1000);
     return gameObject;
   }
 
@@ -854,6 +1090,17 @@ export default class GameScene extends Phaser.Scene {
     if (this.cursors.right.isDown || this.keys.D.isDown) vx += speed;
     if (this.cursors.up.isDown || this.keys.W.isDown) vy -= speed;
     if (this.cursors.down.isDown || this.keys.S.isDown) vy += speed;
+    if (Phaser.Input.Keyboard.JustDown(this.keys.U)) this.togglePanel('tools');
+    if (Phaser.Input.Keyboard.JustDown(this.keys.P)) this.togglePanel('profile');
+    if (Phaser.Input.Keyboard.JustDown(this.keys.R)) this.togglePanel('decor');
+
+    if (Phaser.Input.Keyboard.JustDown(this.keys.ONE)) this.travelToUnlockedMap(0);
+    if (Phaser.Input.Keyboard.JustDown(this.keys.TWO)) this.travelToUnlockedMap(1);
+    if (Phaser.Input.Keyboard.JustDown(this.keys.THREE)) this.travelToUnlockedMap(2);
+    if (Phaser.Input.Keyboard.JustDown(this.keys.FOUR)) this.travelToUnlockedMap(3);
+    if (Phaser.Input.Keyboard.JustDown(this.keys.FIVE)) this.travelToUnlockedMap(4);
+    if (Phaser.Input.Keyboard.JustDown(this.keys.SIX)) this.travelToUnlockedMap(5);
+    if (Phaser.Input.Keyboard.JustDown(this.keys.SEVEN)) this.travelToUnlockedMap(6);
 
     this.player.setVelocity(vx, vy);
     if (vx !== 0 && vy !== 0) this.player.setVelocity(vx * 0.7071, vy * 0.7071);
@@ -862,6 +1109,8 @@ export default class GameScene extends Phaser.Scene {
 
   updatePlayerAnimation(vx, vy) {
     const isMoving = vx !== 0 || vy !== 0;
+    if (!isMoving && this.time.now < this.toolPoseUntil) return;
+
     if (isMoving) {
       if (Math.abs(vx) > Math.abs(vy)) {
         this.lastDirection = vx > 0 ? 'right' : 'left';
@@ -869,13 +1118,27 @@ export default class GameScene extends Phaser.Scene {
         this.lastDirection = vy > 0 ? 'down' : 'up';
       }
       if (this.time.now - this.walkFrameTime > 140) {
-        this.walkFrame = (this.walkFrame + 1) % 3;
+        this.walkFrame = (this.walkFrame + 1) % PLAYER_WALK_SEQUENCE.length;
         this.walkFrameTime = this.time.now;
       }
     } else {
       this.walkFrame = 0;
     }
-    this.player.setTexture(`player_${this.lastDirection}_${this.walkFrame}`);
+    this.player.setFlipX(this.lastDirection === 'left');
+    this.player.setTexture(this.getPlayerFrameKey(this.lastDirection, this.walkFrame));
+  }
+
+  getPlayerFrameKey(direction, frame) {
+    const textureFrame = PLAYER_WALK_SEQUENCE[frame] ?? 0;
+    if (direction === 'left' || direction === 'right') return `player_side_${textureFrame}`;
+    return `player_front_${textureFrame}`;
+  }
+
+  showPlayerToolPose(textureKey) {
+    if (!this.player || !this.textures.exists(textureKey)) return;
+    this.player.setFlipX(this.lastDirection === 'left');
+    this.player.setTexture(textureKey);
+    this.toolPoseUntil = this.time.now + 280;
   }
 
   handleWorldClick(pointer) {
@@ -884,6 +1147,8 @@ export default class GameScene extends Phaser.Scene {
     const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
     const col = Math.floor(worldPoint.x / TILE_SIZE);
     const row = Math.floor(worldPoint.y / TILE_SIZE);
+    if (this.selectedTool === 'decor') return this.placeSelectedDecoration(col, row);
+
     const plot = this.plots.get(this.plotId(col, row));
     if (!plot) return this.setHint('Chỉ các ô đất màu nâu mới làm nông được.');
 
@@ -896,6 +1161,81 @@ export default class GameScene extends Phaser.Scene {
     if (distance > TILE_SIZE * 2.2) return this.setHint('Hãy đi lại gần ô đất đó trước.');
 
     return this.usePlot(plot);
+  }
+
+  handleNpcClick(npcId) {
+    if (this.activePanel) return;
+    const npcEntry = this.npcSprites[npcId];
+    if (!npcEntry) return;
+
+    const distance = Phaser.Math.Distance.Between(
+      this.player.x,
+      this.player.y,
+      npcEntry.sprite.x,
+      npcEntry.sprite.y,
+    );
+    if (distance > TILE_SIZE * 2.2) {
+      this.setHint('Hay lai gan NPC hon de noi chuyen.');
+      return;
+    }
+
+    if (this.isGiftItem(this.selectedItem)) {
+      const npc = getNpcById(npcId);
+      if (!npc) return;
+      if (this.inventory[this.selectedItem] <= 0) {
+        this.setHint('Ban khong con mon qua nay trong tui.');
+        return;
+      }
+      const giftName = this.itemLabel(this.selectedItem);
+      const giftResult = giveGiftToNpc(this.npcState, npc, giftName);
+      this.inventory[this.selectedItem] -= 1;
+      this.gainSkillExp('gift');
+      this.persistGameState();
+      this.refreshHud();
+      this.setHint(`${npc.name}: ${giftResult.reaction} ${giftName} (${giftResult.delta > 0 ? '+' : ''}${giftResult.delta} tim)`);
+      return;
+    }
+
+    const result = talkToNpc(this.npcState, npcId);
+    if (!result) return;
+    this.gainSkillExp('talk');
+    this.persistGameState();
+    const toolHint = npcId === 'anhMinh' ? ' Bam U de nang cap dung cu.' : '';
+    this.setHint(`${result.npc.name}: ${result.dialogue}  Tim: ${result.friendship.toFixed(2)}/10${toolHint}`);
+  }
+
+  selectDecorationItem(decorationId) {
+    if (!selectDecoration(this.decorationState, decorationId)) return;
+    const item = getSelectedDecoration(this.decorationState);
+    this.selectedTool = 'decor';
+    this.togglePanel(null);
+    this.setHint(`Da chon ${item.name}. Bam len dat trong map de dat trang tri.`);
+    this.refreshHud();
+  }
+
+  placeSelectedDecoration(col, row) {
+    if (col < 0 || row < 0 || col >= MAP_COLS || row >= MAP_ROWS) return;
+    const existing = this.decorationState.placed.some((item) => item.col === col && item.row === row);
+    if (existing) return this.setHint('O nay da co trang tri.');
+    const item = placeDecoration(this.decorationState, col, row);
+    this.addDecorationSprite(item, col, row);
+    this.persistGameState();
+    this.refreshHud();
+    return this.setHint(`Da dat ${item.name}. Diem tham my: ${getAestheticScore(this.decorationState)}/100.`);
+  }
+
+  addDecorationSprite(item, col, row) {
+    const sprite = this.add.image(col * TILE_SIZE, row * TILE_SIZE, item.texture).setOrigin(0);
+    this.decorationSprites.push(sprite);
+  }
+
+  renderPlacedDecorations() {
+    this.decorationSprites.forEach((sprite) => sprite.destroy());
+    this.decorationSprites = [];
+    this.decorationState.placed.forEach((placed) => {
+      const item = getDecorationById(placed.id);
+      if (item) this.addDecorationSprite(item, placed.col, placed.row);
+    });
   }
 
   usePlot(plot) {
@@ -920,8 +1260,12 @@ export default class GameScene extends Phaser.Scene {
   }
 
   hoePlot(plot) {
+    this.showPlayerToolPose('player_tool_hoe');
     plot.state = PlotState.TILLED;
     plot.tile.setTexture('tilled');
+    recordQuestProgress(this.questState, 'tilledPlots', 1);
+    this.gainSkillExp('till');
+    this.persistGameState();
     return this.setHint('Đã cuốc đất. Chọn hạt trong balo rồi bấm ô này để gieo.');
   }
 
@@ -935,19 +1279,25 @@ export default class GameScene extends Phaser.Scene {
       this.togglePanel('shop');
       return this.setHint(`Bạn đã hết hạt ${CropTypes[cropKey].name}. Hãy mua thêm trong shop.`);
     }
+    this.showPlayerToolPose('player_tool_idle');
     this.inventory[this.selectedItem] -= 1;
     plot.state = PlotState.SEEDED;
     plot.cropType = cropKey;
     plot.wateredAt = 0;
     plot.plant = this.add.image(plot.col * TILE_SIZE, plot.row * TILE_SIZE, `${plot.cropType}_sprout`).setOrigin(0);
+    this.gainSkillExp('plant');
     this.refreshHud();
+    this.persistGameState();
     return this.setHint(`Đã gieo cây ${CropTypes[plot.cropType].name}. Bấm lại ô này để tưới nước.`);
   }
 
   waterPlot(plot) {
+    this.showPlayerToolPose('player_tool_water');
     plot.state = PlotState.WATERED;
     plot.wateredAt = this.time.now;
     plot.tile.setTexture('wateredSoil');
+    this.gainSkillExp('water');
+    this.persistGameState();
     return this.setHint(`Đã tưới nước. Cây ${CropTypes[plot.cropType].name} sẽ lớn trong ${this.formatDuration(CropTypes[plot.cropType].duration)}.`);
   }
 
@@ -958,7 +1308,11 @@ export default class GameScene extends Phaser.Scene {
   }
 
   harvestPlot(plot) {
+    this.showPlayerToolPose('player_tool_axe');
     this.inventory[`crop_${plot.cropType}`] += 1;
+    if (plot.cropType === 'white') recordQuestProgress(this.questState, 'carrots', 1);
+    if (plot.cropType === 'green') recordQuestProgress(this.questState, 'turnips', 1);
+    this.gainSkillExp('harvest');
     plot.state = PlotState.EMPTY;
     plot.tile.setTexture('soil');
     plot.plant.destroy();
@@ -966,6 +1320,7 @@ export default class GameScene extends Phaser.Scene {
     plot.cropType = null;
     plot.wateredAt = 0;
     this.refreshHud();
+    this.persistGameState();
     return this.setHint('Đã thu hoạch một nông sản.');
   }
 
@@ -981,6 +1336,304 @@ export default class GameScene extends Phaser.Scene {
         plot.plant.setTexture(`${plot.cropType}_plant`);
       }
     });
+  }
+
+  createWeatherEffects() {
+    this.weatherParticles = [];
+    this.weatherOverlay = this.fixed(this.add.rectangle(0, 0, VIEW_WIDTH, VIEW_HEIGHT, 0x000000, 0).setOrigin(0));
+    this.weatherOverlay.setDepth(900);
+    this.refreshWeatherEffects();
+  }
+
+  refreshWeatherEffects() {
+    if (!this.weatherParticles) return;
+    this.weatherParticles.forEach((particle) => particle.destroy());
+    this.weatherParticles = [];
+    if (this.weatherOverlay) this.weatherOverlay.setFillStyle(0x000000, 0);
+
+    const weather = this.worldState.weather;
+    if (weather === 'drizzle' || weather === 'storm') {
+      const count = weather === 'storm' ? 90 : 48;
+      for (let i = 0; i < count; i += 1) {
+        const drop = this.fixed(this.add.rectangle(
+          Phaser.Math.Between(0, VIEW_WIDTH),
+          Phaser.Math.Between(0, VIEW_HEIGHT),
+          weather === 'storm' ? 2 : 1,
+          weather === 'storm' ? 16 : 10,
+          0x9dd4ff,
+          weather === 'storm' ? 0.75 : 0.45,
+        ));
+        drop.setDepth(901);
+        drop.speed = Phaser.Math.Between(weather === 'storm' ? 420 : 220, weather === 'storm' ? 620 : 360);
+        this.weatherParticles.push(drop);
+      }
+      this.weatherOverlay.setFillStyle(0x1d2b45, weather === 'storm' ? 0.18 : 0.08);
+    } else if (weather === 'snow') {
+      for (let i = 0; i < 55; i += 1) {
+        const flake = this.fixed(this.add.rectangle(
+          Phaser.Math.Between(0, VIEW_WIDTH),
+          Phaser.Math.Between(0, VIEW_HEIGHT),
+          3,
+          3,
+          0xffffff,
+          0.72,
+        ));
+        flake.setDepth(901);
+        flake.speed = Phaser.Math.Between(35, 90);
+        flake.drift = Phaser.Math.FloatBetween(-18, 18);
+        this.weatherParticles.push(flake);
+      }
+      this.weatherOverlay.setFillStyle(0xbfd8ff, 0.12);
+    } else if (weather === 'fog') {
+      this.weatherOverlay.setFillStyle(0xd7e6df, 0.32);
+    } else if (weather === 'rainbow') {
+      [0xff6b6b, 0xffd46b, 0x7cc957, 0x75c9ed, 0x9b8bd3].forEach((color, index) => {
+        const band = this.fixed(this.add.rectangle(500 + index * 10, 42 + index * 8, 210, 6, color, 0.35).setAngle(-18));
+        band.setDepth(901);
+        this.weatherParticles.push(band);
+      });
+    }
+  }
+
+  updateWeatherEffects() {
+    if (!this.weatherParticles?.length) return;
+    const deltaSeconds = this.game.loop.delta / 1000;
+    this.weatherParticles.forEach((particle) => {
+      if (!particle.speed) return;
+      particle.y += particle.speed * deltaSeconds;
+      if (particle.drift) particle.x += particle.drift * deltaSeconds;
+      if (particle.y > VIEW_HEIGHT + 20) {
+        particle.y = -20;
+        particle.x = Phaser.Math.Between(0, VIEW_WIDTH);
+      }
+    });
+  }
+
+  sleepToNextDay() {
+    advanceDay(this.worldState);
+    const unlockOrder = ['MAP_02', 'MAP_03', 'MAP_04', 'MAP_05', 'MAP_06', 'MAP_07'];
+    const unlockIndex = Math.min(unlockOrder.length - 1, Math.floor(this.worldState.day / 2) - 1);
+    if (unlockIndex >= 0) unlockMap(this.mapState, unlockOrder[unlockIndex]);
+    this.gameState.player.day = this.worldState.day;
+    this.gameState.player.season = this.worldState.season;
+    this.gameState.player.energy = 100;
+    this.persistGameState();
+    const weather = getWeatherInfo(this.worldState);
+    this.refreshWeatherEffects();
+    this.setHint(`Ngay moi: ${weather.seasonName}, thoi tiet ${weather.weatherName}. ${weather.effect}`);
+    this.refreshHud();
+  }
+
+  persistGameState() {
+    this.gameState.player.money = this.money;
+    this.gameState.inventory = this.inventory;
+    this.gameState.chest = this.chest;
+    this.gameState.story = this.storyState;
+    this.gameState.npcs = this.npcState;
+    this.gameState.world = this.worldState;
+    this.gameState.quests = this.questState;
+    this.gameState.maps = this.mapState;
+    this.gameState.decorations = this.decorationState;
+    saveGame(this.gameState);
+  }
+
+  gainSkillExp(action) {
+    const result = addSkillExp(this.gameState.player, action);
+    if (result?.leveledUp) {
+      this.setHint(`${result.skill} da len Lv ${result.level}!`);
+    }
+    this.persistGameState();
+  }
+
+  nextRumor() {
+    this.setHint(`Tin don moi: ${advanceRumor(this.storyState)}`);
+    this.persistGameState();
+    this.refreshHud();
+  }
+
+  findJournalPage() {
+    const result = findJournalPage(this.storyState);
+    this.setHint(result.message);
+    this.persistGameState();
+    return this.refreshHud();
+  }
+
+  increaseReputation(amount, message = null) {
+    increaseReputation(this.storyState, amount);
+    if (message) this.setHint(`${message} Danh tieng +${amount}.`);
+    this.persistGameState();
+    this.refreshHud();
+  }
+
+  updateStoryPanel() {
+    if (!this.storyText) return;
+    this.storyText.setText(getStoryPanelLines(this.storyState));
+  }
+
+  nextGameSystem() {
+    nextSystem(this.systemCatalogState);
+    this.updateSystemCatalogPanel();
+  }
+
+  previousGameSystem() {
+    previousSystem(this.systemCatalogState);
+    this.updateSystemCatalogPanel();
+  }
+
+  updateSystemCatalogPanel() {
+    if (!this.systemCatalogText) return;
+    const view = getSystemCatalogView(this.systemCatalogState);
+    this.systemCatalogText.setText(view.lines);
+    this.updateSystemCatalogScrollbar(view);
+  }
+
+  scrollGameSystems(deltaLines) {
+    const view = scrollSystemCatalog(this.systemCatalogState, deltaLines);
+    if (this.systemCatalogText) this.systemCatalogText.setText(view.lines);
+    this.updateSystemCatalogScrollbar(view);
+  }
+
+  updateSystemCatalogScrollbar(view) {
+    if (!this.systemScrollThumb || !this.systemScrollTrack) return;
+    const trackTop = this.systemScrollTrack.y - this.systemScrollTrack.displayHeight / 2;
+    const trackHeight = this.systemScrollTrack.displayHeight;
+    const thumbHeight = view.maxScroll === 0 ? trackHeight : Math.max(28, trackHeight * (view.visibleLines / view.totalLines));
+    const travel = Math.max(0, trackHeight - thumbHeight);
+    const progress = view.maxScroll === 0 ? 0 : view.scrollLine / view.maxScroll;
+    this.systemScrollThumb.setDisplaySize(this.systemScrollThumb.displayWidth, thumbHeight);
+    this.systemScrollThumb.y = trackTop + thumbHeight / 2 + travel * progress;
+  }
+
+  updateQuestJournalPanel() {
+    if (!this.questJournalText) return;
+    const quest = getQuestJournalView(this.questState);
+    const taskLines = quest.tasks.map((task) => {
+      const current = Math.min(task.current, task.target);
+      return `- ${task.label}: ${current}/${task.target}`;
+    });
+    this.questJournalText.setText([
+      quest.title,
+      `NPC dan dat: ${quest.guideNpc}`,
+      '',
+      quest.objective,
+      '',
+      'Tien do:',
+      ...taskLines,
+      '',
+      `Phan thuong: ${quest.rewards.join(', ')}`,
+      quest.completed ? 'Trang thai: Da du dieu kien hoan thanh.' : 'Trang thai: Dang thuc hien.',
+    ]);
+  }
+
+  updateMapPanel() {
+    if (!this.mapPanelText) return;
+    const currentMap = getCurrentMap(this.mapState);
+    const unlockedMaps = getUnlockedMaps(this.mapState);
+    this.mapPanelText.setText([
+      `Dang o: ${currentMap.name}`,
+      '',
+      'Ban do da mo:',
+      ...unlockedMaps.map((map, index) => `${index + 1}. ${map.name} (${map.size.cols}x${map.size.rows}) - ${map.features.join(', ')}`),
+      '',
+      'Bam phim 1-7 de di nhanh den ban do da mo.',
+      'Tam thoi: bam Ngu de mo thu map tiep theo theo tien trinh.',
+    ]);
+  }
+
+  updateWeatherPanel() {
+    if (!this.weatherPanelText) return;
+    const weather = getWeatherInfo(this.worldState);
+    this.weatherPanelText.setText([
+      `Today: Day ${this.worldState.day} - ${weather.seasonName}`,
+      `Weather: ${weather.weatherName}`,
+      '',
+      `Effect: ${weather.effect}`,
+      '',
+      '7-day forecast:',
+      ...weather.forecast.map((entry) => `Day ${entry.day}: ${entry.weather}`),
+      '',
+      'Sources: TV 3 days, Ba Linh forecast, Farmer Almanac 7 days.',
+    ]);
+  }
+
+  getToolUpgradeRows() {
+    return getToolUpgradeRows(this.gameState, this.inventory, this.money);
+  }
+
+  upgradeSelectedTool(toolId) {
+    const result = upgradeTool(this.gameState, this.inventory, this.money, toolId);
+    this.money = result.money;
+    this.persistGameState();
+    this.setHint(result.message);
+    this.refreshHud();
+  }
+
+  updateToolUpgradePanel() {
+    if (!this.toolUpgradeRows || !this.toolUpgradeHint) return;
+    this.toolUpgradeHint.setText('Can tien, Quang Sat va tim voi Anh Minh de nang cap dung cu. Bam U de mo/tat panel nay.');
+    this.getToolUpgradeRows().forEach((tool) => {
+      const row = this.toolUpgradeRows[tool.id];
+      if (!row) return;
+      const reqText = tool.maxed
+        ? 'MAX'
+        : `$${tool.requirement.money}, Quang Sat ${tool.requirement.materialCount}, Anh Minh ${tool.requirement.friendship} tim`;
+      row.label.setText(`${tool.name} cap ${tool.level} -> ${tool.maxed ? 'toi da' : `cap ${tool.level + 1}`} | ${reqText}`);
+      row.bg.setFillStyle(tool.canUpgrade ? 0xffe8b5 : 0xd9aa67);
+      row.button.bg.setFillStyle(tool.canUpgrade ? 0x4b6f3b : 0x6f4428);
+    });
+  }
+
+  renamePlayer() {
+    const nextName = window.prompt('Nhap ten nhan vat:', this.gameState.player.name);
+    if (!nextName?.trim()) return;
+    this.gameState.player.name = nextName.trim().slice(0, 18);
+    this.persistGameState();
+    this.setHint(`Ten nhan vat da doi thanh ${this.gameState.player.name}.`);
+    this.refreshHud();
+  }
+
+  updatePlayerProfilePanel() {
+    if (!this.playerProfileText) return;
+    const player = this.gameState.player;
+    const skillLines = getSkillRows(player).map((row) => (
+      row.maxed ? `- ${row.skill}: Lv ${row.level} MAX` : `- ${row.skill}: Lv ${row.level} (${row.exp}/${row.needed} EXP)`
+    ));
+    const toolLines = Object.entries(player.tools).map(([name, level]) => `- ${name}: Cap ${level}`);
+    this.playerProfileText.setText([
+      `Ten: ${player.name}`,
+      `Energy: ${player.energy}/100`,
+      `Money: ${this.money}`,
+      `Day ${this.worldState.day} - ${this.worldState.season}`,
+      '',
+      'Skills:',
+      ...skillLines,
+      '',
+      'Tools:',
+      ...toolLines.slice(0, 4),
+    ]);
+  }
+
+  updateDecorationPanel() {
+    if (!this.decorationPanelText || !this.decorationRows) return;
+    const selected = getSelectedDecoration(this.decorationState);
+    this.decorationPanelText.setText([
+      `Diem tham my: ${getAestheticScore(this.decorationState)}/100`,
+      `Dang chon: ${selected.name}`,
+      'Bam R de mo panel. Chon mon roi click len map de dat.',
+    ]);
+    Object.entries(this.decorationRows).forEach(([id, row]) => {
+      row.bg.setFillStyle(id === selected.id ? 0xffe2a8 : 0xffe8b5);
+    });
+  }
+
+  travelToUnlockedMap(index) {
+    const unlockedMaps = getUnlockedMaps(this.mapState);
+    const map = unlockedMaps[index];
+    if (!map) return;
+    if (!travelToMap(this.mapState, map.id)) return;
+    this.persistGameState();
+    this.setHint(`Da di den ${map.name}.`);
+    this.scene.restart();
   }
 
   togglePanel(panelName) {
@@ -1014,6 +1667,7 @@ export default class GameScene extends Phaser.Scene {
     this.inventory[`seed_${cropKey}`] += 1;
     this.selectedCrop = cropKey;
     this.selectedItem = `seed_${cropKey}`;
+    this.persistGameState();
     this.refreshHud();
     return this.setHint(`Đã mua một hạt ${CropTypes[cropKey].name}.`);
   }
@@ -1027,6 +1681,7 @@ export default class GameScene extends Phaser.Scene {
     const cropKey = this.selectedItem.replace('crop_', '');
     this.inventory[this.selectedItem] -= 1;
     this.money += CropTypes[cropKey].price;
+    this.persistGameState();
     this.refreshHud();
     return this.setHint(`Đã bán ${CropTypes[cropKey].name} được $${CropTypes[cropKey].price}.`);
   }
@@ -1048,6 +1703,10 @@ export default class GameScene extends Phaser.Scene {
   }
 
   refreshHud() {
+    const storyHud = getStoryHudLines(this.storyState);
+    const weather = getWeatherInfo(this.worldState);
+    const questLines = getQuestSummary(this.questState);
+    if (this.dateText) this.dateText.setText(`${this.gameState.player.name} | Day ${this.worldState.day} ${weather.seasonName}`);
     this.statsText.setText([
       `Tiền: $${this.money}`,
       `${this.getToolName(this.selectedTool)}`,
@@ -1055,6 +1714,11 @@ export default class GameScene extends Phaser.Scene {
     ]);
 
     Object.entries(this.itemRows).forEach(([itemKey, item]) => {
+      this.statsText.setText([
+        `Tien: $${this.money}  DT: ${storyHud.reputation}`,
+        `${this.getToolName(this.selectedTool)} | ${questLines[0]}`,
+        `Nhat ky: ${storyHud.journalPagesFound}/${storyHud.journalTotalPages}`,
+      ]);
       item.row.setFillStyle(itemKey === this.selectedItem ? 0xffe2a8 : 0xd9aa67);
       item.label.setText(`${this.itemLabel(itemKey)} x${this.inventory[itemKey]}`);
     });
@@ -1073,25 +1737,63 @@ export default class GameScene extends Phaser.Scene {
         slot.key === this.selectedTool ||
         (slot.key === 'inventory' && this.activePanel === 'inventory') ||
         (slot.key === 'shop' && this.activePanel === 'shop') ||
-        (slot.key === 'chest' && this.activePanel === 'chest');
+        (slot.key === 'chest' && this.activePanel === 'chest') ||
+        (slot.key === 'quests' && this.activePanel === 'quests') ||
+        (slot.key === 'maps' && this.activePanel === 'maps') ||
+        (slot.key === 'weather' && this.activePanel === 'weather') ||
+        (slot.key === 'story' && this.activePanel === 'story') ||
+        (slot.key === 'systems' && this.activePanel === 'systems');
       slot.bg.setFillStyle(active ? 0xffe2a8 : 0xf0d3a0);
     });
+    this.updateStoryPanel();
+    this.updateSystemCatalogPanel();
+    this.updateQuestJournalPanel();
+    this.updateMapPanel();
+    this.updateWeatherPanel();
+    this.updateToolUpgradePanel();
+    this.updatePlayerProfilePanel();
+    this.updateDecorationPanel();
   }
 
   itemKeys() {
-    return ['seed_white', 'seed_green', 'seed_blue', 'crop_white', 'crop_green', 'crop_blue'];
+    return [
+      'seed_white',
+      'seed_green',
+      'seed_blue',
+      'crop_white',
+      'crop_green',
+      'crop_blue',
+      'gift_rose',
+      'gift_iron_ore',
+      'gift_book',
+      'gift_candy',
+      'gift_mushroom',
+    ];
   }
 
   itemLabel(itemKey) {
+    const giftNames = {
+      gift_rose: 'Hoa Hong',
+      gift_iron_ore: 'Quang Sat',
+      gift_book: 'Sach',
+      gift_candy: 'Keo',
+      gift_mushroom: 'Nam Rung',
+    };
+    if (giftNames[itemKey]) return giftNames[itemKey];
     const [type, cropKey] = itemKey.split('_');
     const prefix = type === 'seed' ? 'Hạt' : 'Nông sản';
     return `${prefix} ${CropTypes[cropKey].name}`;
   }
 
   itemIcon(itemKey) {
+    if (this.isGiftItem(itemKey)) return 'flower';
     if (itemKey.startsWith('seed_')) return 'seedBag';
     const cropKey = itemKey.replace('crop_', '');
     return `${cropKey}_ready`;
+  }
+
+  isGiftItem(itemKey) {
+    return itemKey.startsWith('gift_');
   }
 
   getToolName(tool) {
@@ -1100,6 +1802,7 @@ export default class GameScene extends Phaser.Scene {
       seed: 'Gieo hạt',
       water: 'Tưới nước',
       harvest: 'Thu hoạch',
+      decor: 'Trang tri',
     };
     return names[tool] ?? tool;
   }
